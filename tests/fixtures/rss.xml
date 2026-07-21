@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Unicode News</title><link>https://example.com/</link>
+<item><guid>one</guid><title>Great launch 🚀</title><description><![CDATA[<p>Users are <b>very happy</b> &amp; excited.</p><script>bad()</script>]]></description><pubDate>Mon, 20 Jul 2026 12:00:00 +0000</pubDate></item>
+<item><guid>two</guid><description>Terrible outage</description></item>
+<item><guid>empty</guid></item>
+<item><guid>one</guid><title>Duplicate</title></item>
+</channel></rss>

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "feed-sentiment"
+version = "0.1.0"
+description = "Typed sentiment analysis for RSS and Atom feed snapshots"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Kurt Patrick Yu" }]
+dependencies = [
+  "beautifulsoup4>=4.13,<5",
+  "feedparser>=6.0.11,<7",
+  "httpx>=0.28,<1",
+  "typer>=0.16,<1",
+  "vaderSentiment>=3.3.2,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "mypy>=1.16,<2",
+  "pytest>=8.4,<9",
+  "pytest-httpx>=0.35,<1",
+  "ruff>=0.12,<1",
+  "twine>=6.2,<7",
+]
+
+[project.scripts]
+feed-sentiment = "feed_sentiment.cli.app:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/feed_sentiment"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+mypy_path = "src"
