@@ -1,0 +1,149 @@
+# Byte-compiled Python files
+
+**pycache**/
+*.py[cod]
+*$py.class
+
+# Native extensions
+
+*.so
+*.pyd
+*.dll
+
+# Virtual environments
+
+.venv/
+venv/
+env/
+ENV/
+venv.bak/
+env.bak/
+
+# Environment variables and local secrets
+
+.env
+.env.*
+!.env.example
+
+# Python packaging
+
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+MANIFEST
+
+# Installer and packaging logs
+
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Test output and caches
+
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+test-results/
+junit.xml
+*.cover
+*.py.cover
+.hypothesis/
+
+# Type-checker caches
+
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyright/
+.pyre/
+.pytype/
+
+# Ruff and other lint caches
+
+.ruff_cache/
+.cache/
+
+# Tox and nox
+
+.tox/
+.nox/
+
+# Documentation builds
+
+docs/_build/
+site/
+
+# Jupyter
+
+.ipynb_checkpoints/
+
+# IDEs and editors
+
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+
+*.swp
+*.swo
+*~
+
+# Windows
+
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+
+.directory
+.Trash-*
+
+# Temporary files
+
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.log
+
+# Local databases and state
+
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Local application output
+
+output/
+reports/
+
+# Local profiling and benchmark output
+
+.prof/
+*.prof
+benchmark-results/
+
+# Local Codex or agent scratch files
+
+.agents/
+.codex/
+scratch/
+openspec/
+AGENTS.md
+SKILLS.md

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Atom Feed</title><link href="https://example.com/atom"/>
+<entry><id>a1</id><title>Calm update</title><summary>Everything is stable.</summary><updated>2026-07-20T12:00:00Z</updated></entry>
+</feed>

@@ -1,0 +1,557 @@
+name: Quality Gates
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run pytest
+        id: tests
+        run: >-
+          python -m pytest
+          --junitxml=test-results/python-${{ matrix.python-version }}/pytest.xml
+
+      - name: Upload test results
+        id: test_artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-results-python-${{ matrix.python-version }}
+          path: test-results/python-${{ matrix.python-version }}/pytest.xml
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Write test summary
+        if: always()
+        env:
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.test_artifact.outcome }}
+          PYTHON_VERSION: ${{ matrix.python-version }}
+          REPORT_PATH: test-results/python-${{ matrix.python-version }}/pytest.xml
+          ARTIFACT_NAME: test-results-python-${{ matrix.python-version }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          report = Path(os.environ["REPORT_PATH"])
+          outcome = os.environ["TEST_OUTCOME"]
+          upload = os.environ["UPLOAD_OUTCOME"]
+          if outcome == "success" and upload == "success":
+              overall = "Passed"
+          elif outcome == "cancelled" or upload == "cancelled":
+              overall = "Cancelled"
+          elif outcome == "skipped":
+              overall = "Skipped"
+          else:
+              overall = "Failed"
+
+          counts = None
+          note = ""
+          if report.is_file():
+              try:
+                  root = ET.parse(report).getroot()
+                  suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+                  total = sum(int(item.attrib.get("tests", 0)) for item in suites)
+                  failed = sum(int(item.attrib.get("failures", 0)) for item in suites)
+                  errors = sum(int(item.attrib.get("errors", 0)) for item in suites)
+                  skipped = sum(int(item.attrib.get("skipped", 0)) for item in suites)
+                  duration = sum(float(item.attrib.get("time", 0)) for item in suites)
+                  counts = (total, total - failed - errors - skipped, failed, errors, skipped, duration)
+              except (ET.ParseError, OSError, TypeError, ValueError) as exc:
+                  note = f"JUnit report could not be parsed: {exc}"
+          else:
+              note = "JUnit report was not generated."
+
+          lines = [
+              f"## Tests - Python {os.environ['PYTHON_VERSION']}",
+              "",
+              f"**Overall result: {overall}**",
+              "",
+              "| Run information | Value |",
+              "|---|---|",
+              f"| Workflow trigger | `{os.environ.get('GITHUB_EVENT_NAME', '')}` |",
+              f"| Branch or tag | `{os.environ.get('GITHUB_REF_NAME', '')}` |",
+              f"| Commit SHA | `{os.environ.get('GITHUB_SHA', '')}` |",
+              f"| Operating system | `{os.environ.get('RUNNER_OS', '')}` |",
+              f"| Python version | `{os.environ['PYTHON_VERSION']}` |",
+              "| Pytest command | `python -m pytest --junitxml=" + os.environ["REPORT_PATH"] + "` |",
+              f"| Pytest outcome | `{outcome}` |",
+              f"| JUnit artifact | `{os.environ['ARTIFACT_NAME']}` |",
+              f"| JUnit report | `{os.environ['REPORT_PATH']}` |",
+              f"| Artifact upload | `{upload}` |",
+          ]
+          if counts:
+              total, passed, failed, errors, skipped, duration = counts
+              lines += [
+                  "",
+                  "| Tests | Passed | Failed | Errors | Skipped | Duration (s) |",
+                  "|---:|---:|---:|---:|---:|---:|",
+                  f"| {total} | {passed} | {failed} | {errors} | {skipped} | {duration:.3f} |",
+              ]
+          elif note:
+              lines += ["", f"> {note}"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          PY
+
+  static:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Create static report directory
+        run: mkdir -p test-results/static
+
+      - name: Run Ruff
+        id: ruff
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m ruff check . 2>&1 | tee test-results/static/ruff.txt
+
+      - name: Run mypy
+        id: mypy
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m mypy 2>&1 | tee test-results/static/mypy.txt
+
+      - name: Upload static-check reports
+        id: static_artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: static-check-results
+          path: test-results/static/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Write static-check summary
+        if: always()
+        env:
+          RUFF_OUTCOME: ${{ steps.ruff.outcome }}
+          MYPY_OUTCOME: ${{ steps.mypy.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.static_artifact.outcome }}
+        shell: bash
+        run: |
+          if [[ "$RUFF_OUTCOME" == success && "$MYPY_OUTCOME" == success && "$UPLOAD_OUTCOME" == success ]]; then
+            overall=Passed
+          elif [[ "$RUFF_OUTCOME" == cancelled || "$MYPY_OUTCOME" == cancelled || "$UPLOAD_OUTCOME" == cancelled ]]; then
+            overall=Cancelled
+          elif [[ "$RUFF_OUTCOME" == skipped && "$MYPY_OUTCOME" == skipped ]]; then
+            overall=Skipped
+          else
+            overall=Failed
+          fi
+          {
+            echo "## Static checks"
+            echo
+            echo "**Overall result: $overall**"
+            echo
+            echo "| Check | Command / report | Outcome |"
+            echo "|---|---|---|"
+            echo '| Python | `3.12` | n/a |'
+            echo "| Ruff | \`python -m ruff check .\` / \`test-results/static/ruff.txt\` | \`$RUFF_OUTCOME\` |"
+            echo "| mypy | \`python -m mypy\` / \`test-results/static/mypy.txt\` | \`$MYPY_OUTCOME\` |"
+            echo "| Artifact | \`static-check-results\` | \`$UPLOAD_OUTCOME\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  package:
+    name: Package validation
+    needs: [tests, static]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install release tools
+        run: python -m pip install --upgrade pip "build>=1.2,<2" "twine>=6.2,<7"
+
+      - name: Prepare package reports
+        run: |
+          rm -rf build dist
+          mkdir -p test-results/package
+          touch test-results/package/twine.txt
+          touch test-results/package/content-inspection.txt
+          touch test-results/package/wheel-smoke.txt
+          touch test-results/package/sdist-smoke.txt
+
+      - name: Build distributions
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m build 2>&1 | tee test-results/package/build.txt
+
+      - name: Require exactly one wheel
+        id: wheel_presence
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          printf 'Wheel count: %s\n' "${#wheels[@]}" | tee test-results/package/presence.txt
+          [[ ${#wheels[@]} -eq 1 ]] || { printf 'Expected exactly one wheel; found %s\n' "${#wheels[@]}" >&2; exit 1; }
+
+      - name: Require exactly one source distribution
+        id: sdist_presence
+        shell: bash
+        run: |
+          shopt -s nullglob
+          sdists=(dist/*.tar.gz)
+          printf 'Source distribution count: %s\n' "${#sdists[@]}" | tee -a test-results/package/presence.txt
+          [[ ${#sdists[@]} -eq 1 ]] || { printf 'Expected exactly one source distribution; found %s\n' "${#sdists[@]}" >&2; exit 1; }
+
+      - name: Validate distribution metadata
+        id: twine
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m twine check --strict dist/* 2>&1 | tee test-results/package/twine.txt
+
+      - name: Inspect distribution contents and write manifest
+        id: content
+        shell: bash
+        run: |
+          set -o pipefail
+          python - <<'PY' 2>&1 | tee test-results/package/content-inspection.txt
+          from __future__ import annotations
+
+          import hashlib
+          import tarfile
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          dist = Path("dist")
+          files = sorted(path for path in dist.iterdir() if path.is_file())
+          if len(files) != 2:
+              raise SystemExit(f"Expected two distributions, found {len(files)}")
+
+          forbidden_parts = {
+              ".git", ".venv", "openspec", "__pycache__", ".pytest_cache",
+              ".mypy_cache", ".ruff_cache", "build", "dist", "output", "reports",
+          }
+          forbidden_suffixes = {
+              ".db", ".sqlite", ".sqlite3", ".pyc", ".pyo", ".pem", ".key",
+              ".p12", ".pfx",
+          }
+          forbidden_names = {"credentials", "credentials.json", "secrets.json", "id_rsa"}
+
+          def inspect(path: Path) -> list[str]:
+              if path.suffix == ".whl":
+                  with zipfile.ZipFile(path) as archive:
+                      names = archive.namelist()
+              else:
+                  with tarfile.open(path, "r:gz") as archive:
+                      names = archive.getnames()
+              normalized = [PurePosixPath(name.replace("\\", "/")) for name in names]
+              lowered = [tuple(part.lower() for part in item.parts) for item in normalized]
+              violations = []
+              for item, parts in zip(normalized, lowered, strict=True):
+                  basename = parts[-1] if parts else ""
+                  if any(part in forbidden_parts for part in parts):
+                      violations.append(str(item))
+                  if basename == ".env" or basename.startswith(".env."):
+                      violations.append(str(item))
+                  if basename in forbidden_names:
+                      violations.append(str(item))
+                  if PurePosixPath(basename).suffix.lower() in forbidden_suffixes:
+                      violations.append(str(item))
+              checks = {
+                  "package Python files": any("feed_sentiment" in parts and str(item).endswith(".py") for item, parts in zip(normalized, lowered, strict=True)),
+                  "package metadata": any(parts and (parts[-1] == "metadata" or parts[-1] == "pkg-info") for parts in lowered),
+                  "CLI entry-point metadata": any(parts and parts[-1] == "entry_points.txt" for parts in lowered) if path.suffix == ".whl" else any(parts and parts[-1] == "pyproject.toml" for parts in lowered),
+                  "MIT license": any(parts and parts[-1].startswith("license") for parts in lowered),
+                  "README/long-description evidence": any(parts and (parts[-1].startswith("readme") or parts[-1] in {"metadata", "pkg-info"}) for parts in lowered),
+              }
+              missing = [label for label, present in checks.items() if not present]
+              print(f"{path.name}: {len(names)} archive members")
+              for label, present in checks.items():
+                  print(f"  {label}: {'present' if present else 'MISSING'}")
+              if violations:
+                  print("  forbidden members:")
+                  for member in sorted(set(violations)):
+                      print(f"    {member}")
+              if missing or violations:
+                  raise SystemExit(f"Content validation failed for {path.name}")
+              return names
+
+          manifest_lines = ["filename\ttype\tsize_bytes\tsha256"]
+          checksum_lines = []
+          for path in files:
+              inspect(path)
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              kind = "wheel" if path.suffix == ".whl" else "sdist"
+              manifest_lines.append(f"{path.name}\t{kind}\t{path.stat().st_size}\t{digest}")
+              checksum_lines.append(f"{digest}  {path.name}")
+          Path("test-results/package/distributions.txt").write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
+          Path("test-results/package/SHA256SUMS").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Smoke-test clean wheel installation
+        id: wheel_smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          WHEEL="$(realpath dist/*.whl)"
+          ENV_DIR="$RUNNER_TEMP/feed-sentiment-wheel"
+          python -m venv "$ENV_DIR"
+          {
+            "$ENV_DIR/bin/python" -m pip install "$WHEEL"
+            cd "$RUNNER_TEMP"
+            "$ENV_DIR/bin/python" - <<'PY'
+          import json
+          from importlib.metadata import version
+          import feed_sentiment
+          from feed_sentiment import RetrievalPolicy, analyze_text
+
+          installed = version("feed-sentiment")
+          result = analyze_text("This release is excellent!")
+          assert result.label == "positive"
+          assert feed_sentiment.__version__ == installed
+          assert RetrievalPolicy().user_agent == (
+              f"feed-sentiment/{installed} "
+              "(+https://github.com/kurtpatrickyu/feed-sentiment)"
+          )
+          print(json.dumps({
+              "version": installed, "import": "passed", "analyze_text": result.label,
+              "user_agent": "passed"
+          }))
+          PY
+            "$ENV_DIR/bin/feed-sentiment" --help >/dev/null
+            CLI_VERSION="$($ENV_DIR/bin/feed-sentiment --version)"
+            INSTALLED_VERSION="$($ENV_DIR/bin/python -c 'from importlib.metadata import version; print(version("feed-sentiment"))')"
+            [[ "$CLI_VERSION" == "$INSTALLED_VERSION" ]]
+            printf 'CLI help: passed\nCLI version: passed (%s)\n' "$CLI_VERSION"
+          } 2>&1 | tee test-results/package/wheel-smoke.txt
+
+      - name: Smoke-test clean source-distribution installation
+        id: sdist_smoke
+        shell: bash
+        run: |
+          set -o pipefail
+          SDIST="$(realpath dist/*.tar.gz)"
+          ENV_DIR="$RUNNER_TEMP/feed-sentiment-sdist"
+          python -m venv "$ENV_DIR"
+          {
+            "$ENV_DIR/bin/python" -m pip install "$SDIST"
+            cd "$RUNNER_TEMP"
+            "$ENV_DIR/bin/python" - <<'PY'
+          import json
+          from importlib.metadata import version
+          import feed_sentiment
+          from feed_sentiment import analyze_text
+
+          installed = version("feed-sentiment")
+          result = analyze_text("This release is excellent!")
+          assert result.label == "positive"
+          assert feed_sentiment.__version__ == installed
+          print(json.dumps({
+              "version": installed, "import": "passed", "analyze_text": result.label
+          }))
+          PY
+            "$ENV_DIR/bin/feed-sentiment" --help >/dev/null
+            CLI_VERSION="$($ENV_DIR/bin/feed-sentiment --version)"
+            INSTALLED_VERSION="$($ENV_DIR/bin/python -c 'from importlib.metadata import version; print(version("feed-sentiment"))')"
+            [[ "$CLI_VERSION" == "$INSTALLED_VERSION" ]]
+            printf 'CLI help: passed\nCLI version: passed (%s)\n' "$CLI_VERSION"
+          } 2>&1 | tee test-results/package/sdist-smoke.txt
+
+      - name: Upload validated distributions
+        id: distributions_artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload package diagnostics
+        id: diagnostics_artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: package-validation-results
+          path: test-results/package/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Write package-validation summary
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          WHEEL_OUTCOME: ${{ steps.wheel_presence.outcome }}
+          SDIST_OUTCOME: ${{ steps.sdist_presence.outcome }}
+          TWINE_OUTCOME: ${{ steps.twine.outcome }}
+          CONTENT_OUTCOME: ${{ steps.content.outcome }}
+          WHEEL_SMOKE_OUTCOME: ${{ steps.wheel_smoke.outcome }}
+          SDIST_SMOKE_OUTCOME: ${{ steps.sdist_smoke.outcome }}
+          DIST_UPLOAD_OUTCOME: ${{ steps.distributions_artifact.outcome }}
+          DIAG_UPLOAD_OUTCOME: ${{ steps.diagnostics_artifact.outcome }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          outcomes = {
+              "Build": os.environ["BUILD_OUTCOME"],
+              "Wheel presence": os.environ["WHEEL_OUTCOME"],
+              "Source-distribution presence": os.environ["SDIST_OUTCOME"],
+              "Twine validation": os.environ["TWINE_OUTCOME"],
+              "Distribution-content validation": os.environ["CONTENT_OUTCOME"],
+              "Wheel clean-install smoke test": os.environ["WHEEL_SMOKE_OUTCOME"],
+              "Source-distribution clean-install smoke test": os.environ["SDIST_SMOKE_OUTCOME"],
+              "Distribution artifact upload": os.environ["DIST_UPLOAD_OUTCOME"],
+              "Diagnostic artifact upload": os.environ["DIAG_UPLOAD_OUTCOME"],
+          }
+          values = list(outcomes.values())
+          if all(value == "success" for value in values):
+              overall = "Passed"
+          elif any(value == "cancelled" for value in values):
+              overall = "Cancelled"
+          elif all(value == "skipped" for value in values):
+              overall = "Skipped"
+          else:
+              overall = "Failed"
+
+          def smoke_details(path: Path, user_agent: bool) -> list[str]:
+              if not path.is_file():
+                  return ["Not available (report missing)."]
+              text = path.read_text(encoding="utf-8", errors="replace")
+              data = None
+              for line in text.splitlines():
+                  try:
+                      candidate = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  if isinstance(candidate, dict) and "version" in candidate:
+                      data = candidate
+              if data is None:
+                  return ["Not available (smoke test did not reach result output)."]
+              details = [
+                  f"Installed version: `{data.get('version', 'unavailable')}`",
+                  f"package import: `{data.get('import', 'unavailable')}`",
+                  f"analyze_text(): `{data.get('analyze_text', 'unavailable')}`",
+                  "CLI --help: `passed`" if "CLI help: passed" in text else "CLI --help: `unavailable`",
+                  "CLI --version: `passed`" if "CLI version: passed" in text else "CLI --version: `unavailable`",
+              ]
+              if user_agent:
+                  details.insert(3, f"Dynamic User-Agent: `{data.get('user_agent', 'unavailable')}`")
+              return details
+
+          lines = [
+              "## Package validation",
+              "",
+              f"**Overall result: {overall}**",
+              "",
+              "### Run information",
+              "",
+              "| Item | Value |",
+              "|---|---|",
+              f"| Workflow trigger | `{os.environ.get('GITHUB_EVENT_NAME', '')}` |",
+              f"| Branch or tag | `{os.environ.get('GITHUB_REF_NAME', '')}` |",
+              f"| Commit SHA | `{os.environ.get('GITHUB_SHA', '')}` |",
+              f"| Runner operating system | `{os.environ.get('RUNNER_OS', '')}` |",
+              "| Python version | `3.12` |",
+              "| Build backend | `hatchling.build` |",
+              "",
+              "### Gate outcomes",
+              "",
+              "| Gate | Outcome |",
+              "|---|---|",
+          ]
+          lines.extend(f"| {name} | `{outcome}` |" for name, outcome in outcomes.items())
+          manifest = Path("test-results/package/distributions.txt")
+          lines += ["", "### Distribution details", ""]
+          if manifest.is_file():
+              rows = manifest.read_text(encoding="utf-8").splitlines()
+              if len(rows) > 1:
+                  lines += ["| Filename | Type | Size (bytes) | SHA-256 |", "|---|---|---:|---|"]
+                  for row in rows[1:]:
+                      filename, kind, size, digest = row.split("\t")
+                      lines.append(f"| `{filename}` | {kind} | {size} | `{digest}` |")
+              else:
+                  lines.append("No distributions were recorded.")
+          else:
+              lines.append("No distribution manifest was generated.")
+
+          lines += ["", "### Smoke-test details", "", "**Wheel**", ""]
+          lines.extend(f"- {item}" for item in smoke_details(Path("test-results/package/wheel-smoke.txt"), True))
+          lines += ["", "**Source distribution**", ""]
+          lines.extend(f"- {item}" for item in smoke_details(Path("test-results/package/sdist-smoke.txt"), False))
+          lines += [
+              "",
+              "Full logs are in the `package-validation-results` artifact.",
+              "",
+              "### Artifacts",
+              "",
+              "| Artifact | Purpose | Retention | Upload outcome |",
+              "|---|---|---:|---|",
+              f"| `python-package-distributions` | Validated release candidate for the future PyPI publishing workflow | 7 days | `{os.environ['DIST_UPLOAD_OUTCOME']}` |",
+              f"| `package-validation-results` | Build, Twine, content, manifest, checksum, and smoke-test diagnostics | 7 days | `{os.environ['DIAG_UPLOAD_OUTCOME']}` |",
+              "",
+              f"## Overall result: {overall}",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          PY
