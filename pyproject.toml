@@ -6,6 +6,14 @@ build-backend = "hatchling.build"
 name = "feed-sentiment"
 version = "0.1.0"
 description = "Typed sentiment analysis for RSS and Atom feed snapshots"
+keywords = [
+    "rss",
+    "atom",
+    "feed",
+    "sentiment-analysis",
+    "nlp",
+    "news-analysis",
+]
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
