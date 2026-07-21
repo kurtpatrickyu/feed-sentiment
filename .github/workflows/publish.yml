@@ -1,0 +1,691 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Quality gates
+    permissions:
+      contents: read
+    uses: ./.github/workflows/quality.yml
+
+  release_validation:
+    name: Release artifact validation
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      package-version: ${{ steps.metadata.outputs.package-version }}
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install metadata validation tools
+        run: python -m pip install "packaging>=24,<27"
+
+      - name: Initialize validation diagnostics
+        run: mkdir -p release-results
+
+      - name: Validate published release
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_NAME: ${{ github.event.release.name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          from packaging.version import InvalidVersion, Version
+
+          errors = []
+          tag = os.environ["RELEASE_TAG"]
+          if os.environ["EVENT_NAME"] != "release":
+              errors.append("event must be 'release'")
+          if os.environ["EVENT_ACTION"] != "published":
+              errors.append("release action must be 'published'")
+          if os.environ["RELEASE_DRAFT"].lower() != "false":
+              errors.append("draft releases cannot be published to PyPI")
+          if os.environ["RELEASE_PRERELEASE"].lower() != "false":
+              errors.append("GitHub prereleases cannot be published to production PyPI")
+          if not tag:
+              errors.append("release tag is missing")
+          elif not tag.startswith("v"):
+              errors.append("release tag must start with 'v'")
+
+          expected = tag[1:] if tag.startswith("v") else ""
+          if expected:
+              try:
+                  parsed = Version(expected)
+                  if str(parsed) != expected:
+                      errors.append(
+                          f"release version must be canonical: {expected!r} != {str(parsed)!r}"
+                      )
+              except InvalidVersion:
+                  errors.append(f"release tag contains an invalid package version: {expected!r}")
+          if not re.fullmatch(r"[0-9a-fA-F]{40}", os.environ["RELEASE_SHA"]):
+              errors.append("release commit SHA is missing or malformed")
+
+          context = {
+              "event": os.environ["EVENT_NAME"],
+              "action": os.environ["EVENT_ACTION"],
+              "draft": os.environ["RELEASE_DRAFT"].lower(),
+              "prerelease": os.environ["RELEASE_PRERELEASE"].lower(),
+              "tag": tag,
+              "release_name": os.environ["RELEASE_NAME"],
+              "release_sha": os.environ["RELEASE_SHA"],
+              "expected_version": expected,
+              "tag_validation": "passed" if not errors else "failed",
+              "errors": errors,
+          }
+          Path("release-results/release-context.json").write_text(
+              json.dumps(context, indent=2) + "\n", encoding="utf-8"
+          )
+          if errors:
+              raise SystemExit("Release validation failed: " + "; ".join(errors))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"expected-version={expected}\n")
+          print(f"Validated full release {tag} at {os.environ['RELEASE_SHA']}")
+          PY
+
+      - name: Download quality-validated distributions
+        id: download
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Validate distribution artifacts and metadata
+        id: metadata
+        env:
+          EXPECTED_VERSION: ${{ steps.release.outputs.expected-version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import configparser
+          import hashlib
+          import json
+          import os
+          import tarfile
+          import zipfile
+          from datetime import UTC, datetime
+          from email.parser import BytesParser
+          from pathlib import Path
+
+          from packaging.requirements import InvalidRequirement, Requirement
+          from packaging.utils import (
+              InvalidSdistFilename,
+              InvalidWheelFilename,
+              canonicalize_name,
+              parse_sdist_filename,
+              parse_wheel_filename,
+          )
+          from packaging.version import InvalidVersion, Version
+
+          expected_name = "feed-sentiment"
+          expected_version = Version(os.environ["EXPECTED_VERSION"])
+          expected_python = ">=3.12"
+          dist = Path("dist")
+          results = Path("release-results")
+          files = sorted(path for path in dist.iterdir() if path.is_file()) if dist.is_dir() else []
+          wheels = [path for path in files if path.suffix == ".whl"]
+          sdists = [path for path in files if path.name.endswith(".tar.gz")]
+          unknown = [path for path in files if path not in wheels and path not in sdists]
+          errors: list[str] = []
+          checks: dict[str, str] = {}
+
+          def require(condition: bool, label: str, message: str) -> None:
+              checks[label] = "passed" if condition else "failed"
+              if not condition:
+                  errors.append(message)
+
+          def metadata_version_matches(raw: str, label: str) -> bool:
+              try:
+                  matches = Version(raw) == expected_version
+              except InvalidVersion:
+                  matches = False
+              require(matches, label, f"{label.replace('_', ' ')} {raw!r} does not match tag version {expected_version}")
+              return matches
+
+          require(len(files) == 2, "artifact_count", f"expected exactly 2 files, found {len(files)}")
+          require(len(wheels) == 1, "wheel_count", f"expected exactly 1 wheel, found {len(wheels)}")
+          require(len(sdists) == 1, "sdist_count", f"expected exactly 1 sdist, found {len(sdists)}")
+          require(not unknown, "unknown_files", "unexpected artifact files: " + ", ".join(path.name for path in unknown))
+
+          wheel_metadata = None
+          sdist_metadata = None
+          entry_points = ""
+          if len(wheels) == 1:
+              try:
+                  with zipfile.ZipFile(wheels[0]) as archive:
+                      metadata_names = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+                      entry_names = [name for name in archive.namelist() if name.endswith(".dist-info/entry_points.txt")]
+                      require(len(metadata_names) == 1, "wheel_metadata_file", "wheel must contain exactly one METADATA file")
+                      require(len(entry_names) == 1, "wheel_entry_points_file", "wheel must contain exactly one entry_points.txt")
+                      if len(metadata_names) == 1:
+                          wheel_metadata = BytesParser().parsebytes(archive.read(metadata_names[0]))
+                      if len(entry_names) == 1:
+                          entry_points = archive.read(entry_names[0]).decode("utf-8")
+              except (OSError, zipfile.BadZipFile, UnicodeDecodeError) as exc:
+                  errors.append(f"wheel could not be inspected: {exc}")
+                  checks["wheel_archive"] = "failed"
+          if len(sdists) == 1:
+              try:
+                  with tarfile.open(sdists[0], "r:gz") as archive:
+                      metadata_members = [member for member in archive.getmembers() if member.name.endswith("/PKG-INFO") and member.isfile()]
+                      require(len(metadata_members) == 1, "sdist_metadata_file", "sdist must contain exactly one PKG-INFO file")
+                      if len(metadata_members) == 1:
+                          extracted = archive.extractfile(metadata_members[0])
+                          if extracted is not None:
+                              sdist_metadata = BytesParser().parsebytes(extracted.read())
+              except (OSError, tarfile.TarError) as exc:
+                  errors.append(f"sdist could not be inspected: {exc}")
+                  checks["sdist_archive"] = "failed"
+
+          wheel_name = wheel_version = wheel_python = ""
+          sdist_name = sdist_version = sdist_python = ""
+          if wheel_metadata is not None:
+              wheel_name = wheel_metadata.get("Name", "")
+              wheel_version = wheel_metadata.get("Version", "")
+              wheel_python = wheel_metadata.get("Requires-Python", "")
+              wheel_license = bool(
+                  wheel_metadata.get("License-Expression")
+                  or wheel_metadata.get("License")
+                  or wheel_metadata.get_all("License-File")
+              )
+              require(canonicalize_name(wheel_name) == expected_name, "wheel_name", f"wheel name is {wheel_name!r}, expected {expected_name!r}")
+              metadata_version_matches(wheel_version, "wheel_version")
+              require(wheel_python == expected_python, "wheel_requires_python", f"wheel Requires-Python is {wheel_python!r}, expected {expected_python!r}")
+              require(wheel_license, "wheel_license", "wheel license metadata is missing")
+          if sdist_metadata is not None:
+              sdist_name = sdist_metadata.get("Name", "")
+              sdist_version = sdist_metadata.get("Version", "")
+              sdist_python = sdist_metadata.get("Requires-Python", "")
+              sdist_license = bool(
+                  sdist_metadata.get("License-Expression")
+                  or sdist_metadata.get("License")
+                  or sdist_metadata.get_all("License-File")
+              )
+              require(canonicalize_name(sdist_name) == expected_name, "sdist_name", f"sdist name is {sdist_name!r}, expected {expected_name!r}")
+              metadata_version_matches(sdist_version, "sdist_version")
+              require(sdist_python == expected_python, "sdist_requires_python", f"sdist Requires-Python is {sdist_python!r}, expected {expected_python!r}")
+              require(sdist_license, "sdist_license", "sdist license metadata is missing")
+
+          if wheel_metadata is not None and sdist_metadata is not None:
+              try:
+                  versions_match = Version(wheel_version) == Version(sdist_version)
+              except InvalidVersion:
+                  versions_match = False
+              require(versions_match, "distribution_versions_match", "wheel and sdist versions differ or are invalid")
+
+          parser = configparser.ConfigParser()
+          entry_value = ""
+          try:
+              if entry_points:
+                  parser.read_string(entry_points)
+              entry_value = parser.get("console_scripts", "feed-sentiment", fallback="")
+          except configparser.Error as exc:
+              errors.append(f"entry-point metadata could not be parsed: {exc}")
+          require(entry_value == "feed_sentiment.cli.app:app", "console_entry_point", f"unexpected or missing feed-sentiment entry point: {entry_value!r}")
+
+          if len(wheels) == 1:
+              try:
+                  filename_name, filename_version, _build, tags = parse_wheel_filename(wheels[0].name)
+                  require(canonicalize_name(filename_name) == expected_name, "wheel_filename_name", "wheel filename has the wrong project name")
+                  require(filename_version == expected_version, "wheel_filename_version", "wheel filename version does not match metadata")
+                  require({str(tag) for tag in tags} == {"py3-none-any"}, "wheel_tag", "expected one universal py3-none-any wheel")
+                  require(wheels[0].name == f"feed_sentiment-{expected_version}-py3-none-any.whl", "wheel_filename", "wheel filename is not the expected universal filename")
+              except InvalidWheelFilename as exc:
+                  errors.append(f"invalid wheel filename: {exc}")
+                  checks["wheel_filename"] = "failed"
+          if len(sdists) == 1:
+              try:
+                  filename_name, filename_version = parse_sdist_filename(sdists[0].name)
+                  require(canonicalize_name(filename_name) == expected_name, "sdist_filename_name", "sdist filename has the wrong project name")
+                  require(filename_version == expected_version, "sdist_filename_version", "sdist filename version does not match metadata")
+                  require(sdists[0].name == f"feed_sentiment-{expected_version}.tar.gz", "sdist_filename", "sdist filename is not the expected filename")
+              except InvalidSdistFilename as exc:
+                  errors.append(f"invalid sdist filename: {exc}")
+                  checks["sdist_filename"] = "failed"
+
+          try:
+              Requirement(f"{expected_name}=={expected_version}")
+              checks["valid_package_version"] = "passed"
+          except InvalidRequirement as exc:
+              errors.append(f"invalid package name/version requirement: {exc}")
+              checks["valid_package_version"] = "failed"
+
+          manifest_lines = [
+              f"GitHub Release tag: {os.environ['RELEASE_TAG']}",
+              f"Release commit SHA: {os.environ['RELEASE_SHA']}",
+              f"Package name: {expected_name}",
+              f"Package version: {expected_version}",
+              f"Validation timestamp UTC: {datetime.now(UTC).isoformat()}",
+              "",
+              "filename\ttype\tsize_bytes\tsha256",
+          ]
+          checksum_lines = []
+          distribution_rows = []
+          for path in files:
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              kind = "wheel" if path in wheels else "sdist" if path in sdists else "unknown"
+              manifest_lines.append(f"{path.name}\t{kind}\t{path.stat().st_size}\t{digest}")
+              checksum_lines.append(f"{digest}  {path.name}")
+              distribution_rows.append({"filename": path.name, "type": kind, "size": path.stat().st_size, "sha256": digest})
+          results.mkdir(exist_ok=True)
+          (results / "manifest.txt").write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
+          (results / "SHA256SUMS").write_text("\n".join(checksum_lines) + ("\n" if checksum_lines else ""), encoding="utf-8")
+          report = {
+              "release_tag": os.environ["RELEASE_TAG"],
+              "release_sha": os.environ["RELEASE_SHA"],
+              "package_name": expected_name,
+              "package_version": str(expected_version),
+              "wheel_count": len(wheels),
+              "sdist_count": len(sdists),
+              "unknown_count": len(unknown),
+              "wheel_metadata_version": wheel_version,
+              "sdist_metadata_version": sdist_version,
+              "requires_python": wheel_python,
+              "checks": checks,
+              "distributions": distribution_rows,
+              "outcome": "passed" if not errors else "failed",
+              "errors": errors,
+          }
+          (results / "release-validation.txt").write_text(
+              json.dumps(report, indent=2) + "\n", encoding="utf-8"
+          )
+          if errors:
+              raise SystemExit("Artifact validation failed: " + "; ".join(errors))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"package-version={expected_version}\n")
+          print(f"Validated {len(files)} release distributions for {expected_name} {expected_version}")
+          PY
+
+      - name: Upload release-validation diagnostics
+        id: validation_artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pypi-release-validation
+          path: release-results/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Write release-validation summary
+        if: always()
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          METADATA_OUTCOME: ${{ steps.metadata.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.validation_artifact.outcome }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_NAME: ${{ github.event.release.name }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def safe(value: object) -> str:
+              return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+          outcomes = [
+              ("Quality workflow", os.environ["QUALITY_RESULT"]),
+              ("Release event validation", os.environ["RELEASE_OUTCOME"]),
+              ("Distribution artifact download", os.environ["DOWNLOAD_OUTCOME"]),
+              ("Artifact metadata validation", os.environ["METADATA_OUTCOME"]),
+              ("Validation artifact upload", os.environ["UPLOAD_OUTCOME"]),
+          ]
+          values = [value for _, value in outcomes]
+          if all(value == "success" for value in values):
+              overall = "Passed"
+          elif any(value == "cancelled" for value in values):
+              overall = "Cancelled"
+          elif all(value == "skipped" for value in values):
+              overall = "Skipped"
+          else:
+              overall = "Failed"
+
+          context = {}
+          report = {}
+          for path, target in [
+              (Path("release-results/release-context.json"), context),
+              (Path("release-results/release-validation.txt"), report),
+          ]:
+              if path.is_file():
+                  try:
+                      target.update(json.loads(path.read_text(encoding="utf-8")))
+                  except (OSError, json.JSONDecodeError):
+                      pass
+
+          lines = [
+              "## Release artifact validation",
+              "",
+              f"**Overall result: {overall}**",
+              "",
+              "| Release information | Value |",
+              "|---|---|",
+              f"| Release tag | `{safe(os.environ['RELEASE_TAG'])}` |",
+              f"| Release name | {safe(os.environ['RELEASE_NAME'])} |",
+              f"| Release commit | `{safe(os.environ['RELEASE_SHA'])}` |",
+              f"| Draft | `{safe(os.environ['RELEASE_DRAFT'])}` |",
+              f"| Prerelease | `{safe(os.environ['RELEASE_PRERELEASE'])}` |",
+              f"| Expected version from tag | `{safe(context.get('expected_version', 'unavailable'))}` |",
+              f"| Package metadata version | `{safe(report.get('package_version', 'unavailable'))}` |",
+              f"| Version match | `{safe(report.get('checks', {}).get('wheel_version', 'unavailable'))}` |",
+              f"| Wheel count | `{safe(report.get('wheel_count', 'unavailable'))}` |",
+              f"| Source-distribution count | `{safe(report.get('sdist_count', 'unavailable'))}` |",
+              "",
+              "### Gate outcomes",
+              "",
+              "| Gate | Outcome |",
+              "|---|---|",
+          ]
+          lines.extend(f"| {name} | `{safe(value)}` |" for name, value in outcomes)
+          lines += ["", "### Distributions", ""]
+          distributions = report.get("distributions", [])
+          if distributions:
+              lines += ["| Filename | Type | Size (bytes) | SHA-256 |", "|---|---|---:|---|"]
+              for item in distributions:
+                  lines.append(
+                      f"| `{safe(item.get('filename', ''))}` | {safe(item.get('type', ''))} | "
+                      f"{safe(item.get('size', ''))} | `{safe(item.get('sha256', ''))}` |"
+                  )
+          else:
+              lines.append("No distribution details were available.")
+          lines += [
+              "",
+              "Validation diagnostics: `pypi-release-validation` (7-day retention).",
+              f"Upload outcome: `{safe(os.environ['UPLOAD_OUTCOME'])}`.",
+              "",
+              f"## Overall result: {overall}",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          PY
+
+  publish:
+    name: Publish validated distributions to PyPI
+    needs: [quality, release_validation]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/feed-sentiment/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distributions with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          print-hash: true
+
+  verify:
+    name: Verify production PyPI release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Initialize verification diagnostics
+        run: mkdir -p release-results
+
+      - name: Install exact release from production PyPI
+        id: install
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -o pipefail
+          [[ "$RELEASE_TAG" == v* ]] || { echo "Release tag must start with v" >&2; exit 1; }
+          EXPECTED_VERSION="${RELEASE_TAG#v}"
+          ENV_DIR="$RUNNER_TEMP/feed-sentiment-pypi"
+          python -m venv "$ENV_DIR"
+          : > release-results/pypi-install.txt
+          installed=false
+          attempts=0
+          for attempt in 1 2 3 4 5; do
+            attempts="$attempt"
+            echo "PyPI installation attempt $attempt of 5 for feed-sentiment==$EXPECTED_VERSION" | tee -a release-results/pypi-install.txt
+            if "$ENV_DIR/bin/python" -m pip install --no-cache-dir --index-url https://pypi.org/simple "feed-sentiment==$EXPECTED_VERSION" 2>&1 | tee -a release-results/pypi-install.txt; then
+              installed=true
+              break
+            fi
+            if [[ "$attempt" -lt 5 ]]; then
+              echo "Version not available yet; retrying in 15 seconds." | tee -a release-results/pypi-install.txt
+              sleep 15
+            fi
+          done
+          printf '%s\n' "$attempts" > release-results/install-attempts.txt
+          [[ "$installed" == true ]] || { echo "Production PyPI installation failed after $attempts attempts" >&2; exit 1; }
+          echo "expected-version=$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
+          echo "environment-dir=$ENV_DIR" >> "$GITHUB_OUTPUT"
+          echo "attempts=$attempts" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test installed PyPI package
+        id: smoke
+        env:
+          EXPECTED_VERSION: ${{ steps.install.outputs.expected-version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          ENV_DIR: ${{ steps.install.outputs.environment-dir }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$RUNNER_TEMP"
+          {
+            "$ENV_DIR/bin/python" - <<'PY'
+          import json
+          import os
+          from importlib.metadata import version
+
+          import feed_sentiment
+          from feed_sentiment import RetrievalPolicy, analyze_text
+
+          expected = os.environ["EXPECTED_VERSION"]
+          installed = version("feed-sentiment")
+          score = analyze_text("This release is excellent!")
+          assert installed == expected
+          assert feed_sentiment.__version__ == installed
+          assert score.label == "positive"
+          assert RetrievalPolicy().user_agent == (
+              f"feed-sentiment/{installed} "
+              "(+https://github.com/kurtpatrickyu/feed-sentiment)"
+          )
+          print(json.dumps({
+              "installed_version": installed,
+              "import": "passed",
+              "public_version": "passed",
+              "analyze_text": score.label,
+              "user_agent": "passed",
+          }))
+          PY
+            "$ENV_DIR/bin/feed-sentiment" --help >/dev/null
+            CLI_VERSION="$($ENV_DIR/bin/feed-sentiment --version)"
+            [[ "$CLI_VERSION" == "$EXPECTED_VERSION" ]]
+            printf 'CLI help: passed\nCLI version: passed (%s)\n' "$CLI_VERSION"
+          } 2>&1 | tee "$GITHUB_WORKSPACE/release-results/pypi-smoke.txt"
+
+      - name: Upload PyPI verification diagnostics
+        id: verification_artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pypi-verification-results
+          path: release-results/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Write PyPI verification summary
+        if: always()
+        env:
+          EXPECTED_VERSION: ${{ steps.install.outputs.expected-version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INSTALL_ATTEMPTS: ${{ steps.install.outputs.attempts }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.verification_artifact.outcome }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          values = [os.environ["INSTALL_OUTCOME"], os.environ["SMOKE_OUTCOME"], os.environ["UPLOAD_OUTCOME"]]
+          if all(value == "success" for value in values):
+              overall = "Passed"
+          elif any(value == "cancelled" for value in values):
+              overall = "Cancelled"
+          elif all(value == "skipped" for value in values):
+              overall = "Skipped"
+          else:
+              overall = "Failed"
+          smoke_text = Path("release-results/pypi-smoke.txt").read_text(encoding="utf-8", errors="replace") if Path("release-results/pypi-smoke.txt").is_file() else ""
+          details = {}
+          for line in smoke_text.splitlines():
+              try:
+                  candidate = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if isinstance(candidate, dict) and "installed_version" in candidate:
+                  details = candidate
+
+          attempts = os.environ["INSTALL_ATTEMPTS"]
+          if not attempts and Path("release-results/install-attempts.txt").is_file():
+              attempts = Path("release-results/install-attempts.txt").read_text(encoding="utf-8").strip()
+          expected_version = os.environ["EXPECTED_VERSION"]
+          if not expected_version and os.environ["RELEASE_TAG"].startswith("v"):
+              expected_version = os.environ["RELEASE_TAG"][1:]
+          lines = [
+              "## Production PyPI verification",
+              "",
+              f"**Overall result: {overall}**",
+              "",
+              "| Check | Result |",
+              "|---|---|",
+              f"| Expected package version | `{expected_version or 'unavailable'}` |",
+              f"| Installation attempts | `{attempts or 'unavailable'}` |",
+              f"| PyPI installation | `{os.environ['INSTALL_OUTCOME']}` |",
+              f"| Installed metadata version | `{details.get('installed_version', 'unavailable')}` |",
+              f"| Package import | `{details.get('import', 'unavailable')}` |",
+              f"| Public `__version__` | `{details.get('public_version', 'unavailable')}` |",
+              f"| `analyze_text()` | `{details.get('analyze_text', 'unavailable')}` |",
+              f"| Dynamic User-Agent | `{details.get('user_agent', 'unavailable')}` |",
+              f"| CLI help | `{'passed' if 'CLI help: passed' in smoke_text else 'unavailable'}` |",
+              f"| CLI version | `{'passed' if 'CLI version: passed' in smoke_text else 'unavailable'}` |",
+              f"| Diagnostic artifact | `pypi-verification-results` (`{os.environ['UPLOAD_OUTCOME']}`) |",
+              "",
+              "A verification failure does not remove or roll back a package that was already published to PyPI.",
+              "",
+              f"## Overall result: {overall}",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          PY
+
+  summary:
+    name: Final publication summary
+    needs: [quality, release_validation, publish, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Write final publication summary
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          VALIDATION_RESULT: ${{ needs.release_validation.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+        run: |
+          python - <<'PY'
+          import os
+
+          def safe(value: str) -> str:
+              return value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+          tag = os.environ["RELEASE_TAG"]
+          version = tag[1:] if tag.startswith("v") else "unavailable"
+          quality = os.environ["QUALITY_RESULT"]
+          validation = os.environ["VALIDATION_RESULT"]
+          publication = os.environ["PUBLISH_RESULT"]
+          verification = os.environ["VERIFY_RESULT"]
+          if all(value == "success" for value in (quality, validation, publication, verification)):
+              overall = "Successful production release"
+          elif publication == "success":
+              overall = "Package published but post-publication verification failed"
+          else:
+              overall = "Package was not published by this run"
+
+          pypi_url = "https://pypi.org/project/feed-sentiment/"
+          lines = [
+              "## Feed Sentiment publication",
+              "",
+              f"**Overall release status: {overall}**",
+              "",
+              "| Stage | Job result | Artifact | URL |",
+              "|---|---|---|---|",
+              f"| Quality gates | `{safe(quality)}` | `python-package-distributions` | n/a |",
+              f"| Release validation | `{safe(validation)}` | `pypi-release-validation` | n/a |",
+              f"| PyPI publication | `{safe(publication)}` | Uses validated distributions | [PyPI]({pypi_url}) |",
+              f"| Post-publication verification | `{safe(verification)}` | `pypi-verification-results` | [PyPI]({pypi_url}) |",
+              "",
+              "| Release information | Value |",
+              "|---|---|",
+              "| PyPI project | `feed-sentiment` |",
+              f"| GitHub Release tag | `{safe(tag)}` |",
+              f"| Package version | `{safe(version)}` |",
+              f"| Release commit SHA | `{safe(os.environ['RELEASE_SHA'])}` |",
+              "| GitHub environment | `pypi` |",
+              "| Authentication | Trusted Publishing OIDC |",
+              "| Distribution artifact | `python-package-distributions` |",
+              "| Validation artifact | `pypi-release-validation` |",
+              "| Verification artifact | `pypi-verification-results` |",
+              f"| PyPI project URL | [feed-sentiment]({pypi_url}) |",
+              f"| GitHub Release URL | [release]({safe(os.environ['RELEASE_URL'])}) |",
+              "| Attestations | Expected: enabled by the publisher action default |",
+              "",
+              "PyPI publication is not rolled back automatically if post-publication verification fails.",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          PY

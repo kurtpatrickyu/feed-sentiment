@@ -76,3 +76,5 @@ python -m twine check --strict dist/*
 Tests use local fixtures and controlled HTTP doubles; the normal suite does not require live public feeds.
 
 The `Quality Gates` GitHub Actions workflow runs pytest on Python 3.12, 3.13, and 3.14, then runs Ruff and mypy before validating clean wheel and source-distribution installations. CI retains seven-day diagnostic artifacts named `test-results-python-<version>`, `static-check-results`, and `package-validation-results`. Successfully validated wheel and source-distribution files are uploaded separately as `python-package-distributions` for a future publishing workflow; generated `dist/` files remain local/CI artifacts and are not committed to Git.
+
+Production publishing setup and the maintainer release procedure are documented in [docs/releasing.md](docs/releasing.md).
