@@ -42,10 +42,19 @@ def main() -> None:
         result = run(
             str(python),
             "-c",
-            "import feed_sentiment; print(feed_sentiment.analyze_text('excellent').label)",
+            "import json, feed_sentiment; "
+            "from feed_sentiment import RetrievalPolicy; "
+            "print(json.dumps({'label': feed_sentiment.analyze_text('excellent').label, "
+            "'version': feed_sentiment.__version__, "
+            "'user_agent': RetrievalPolicy().user_agent}))",
             cwd=temp,
         )
-        assert result.stdout.strip() == "positive"
+        installed = json.loads(result.stdout)
+        assert installed["label"] == "positive"
+        assert installed["user_agent"] == (
+            f"feed-sentiment/{installed['version']} "
+            "(+https://github.com/kurtpatrickyu/feed-sentiment)"
+        )
         run(str(command), "--help", cwd=temp)
         assert run(str(command), "--version", cwd=temp).stdout.strip() == "0.1.0"
 
