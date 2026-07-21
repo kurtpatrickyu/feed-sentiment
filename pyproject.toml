@@ -10,24 +10,52 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Kurt Patrick Yu" }]
+authors = [
+    { name = "Kurt Patrick Yu" },
+]
+keywords = [
+    "rss",
+    "atom",
+    "feed",
+    "sentiment-analysis",
+    "nlp",
+    "news-analysis",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content :: News/Diary",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing",
+]
 dependencies = [
-  "beautifulsoup4>=4.13,<5",
-  "feedparser>=6.0.11,<7",
-  "httpx>=0.28,<1",
-  "typer>=0.16,<1",
-  "vaderSentiment>=3.3.2,<4",
+    "beautifulsoup4>=4.13,<5",
+    "feedparser>=6.0.11,<7",
+    "httpx>=0.28,<1",
+    "typer>=0.16,<1",
+    "vaderSentiment>=3.3.2,<4",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "build>=1.2,<2",
-  "mypy>=1.16,<2",
-  "pytest>=8.4,<9",
-  "pytest-httpx>=0.35,<1",
-  "ruff>=0.12,<1",
-  "twine>=6.2,<7",
+    "build>=1.2,<2",
+    "mypy>=1.16,<2",
+    "pytest>=8.4,<9",
+    "pytest-httpx>=0.35,<1",
+    "ruff>=0.12,<1",
+    "twine>=6.2,<7",
 ]
+
+[project.urls]
+Homepage = "https://github.com/kurtpatrickyu/feed-sentiment"
+Repository = "https://github.com/kurtpatrickyu/feed-sentiment"
+Issues = "https://github.com/kurtpatrickyu/feed-sentiment/issues"
+Changelog = "https://github.com/kurtpatrickyu/feed-sentiment/releases"
 
 [project.scripts]
 feed-sentiment = "feed_sentiment.cli.app:app"
