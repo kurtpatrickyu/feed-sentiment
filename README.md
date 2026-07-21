@@ -66,10 +66,13 @@ These checks are defense in depth for a reusable client, not a complete hosted-s
 
 ```console
 python -m pip install -e ".[dev]"
-pytest
-ruff check .
-mypy
+python -m pytest
+python -m ruff check .
+python -m mypy
 python -m build
+python -m twine check --strict dist/*
 ```
 
 Tests use local fixtures and controlled HTTP doubles; the normal suite does not require live public feeds.
+
+The `Quality Gates` GitHub Actions workflow runs pytest on Python 3.12, 3.13, and 3.14, then runs Ruff and mypy before validating clean wheel and source-distribution installations. CI retains seven-day diagnostic artifacts named `test-results-python-<version>`, `static-check-results`, and `package-validation-results`. Successfully validated wheel and source-distribution files are uploaded separately as `python-package-distributions` for a future publishing workflow; generated `dist/` files remain local/CI artifacts and are not committed to Git.
