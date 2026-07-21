@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from feed_sentiment import __version__
 from feed_sentiment.exceptions import (
     ContentTypeError,
     FeedFormatError,
@@ -103,3 +104,45 @@ def test_retriever_maps_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         HttpxFeedRetriever().fetch(
             "https://example.com/feed", RetrievalPolicy(allow_private_networks=True)
         )
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_user_agent"),
+    [
+        (
+            RetrievalPolicy(allow_private_networks=True),
+            f"feed-sentiment/{__version__} (+https://github.com/kurtpatrickyu/feed-sentiment)",
+        ),
+        (
+            RetrievalPolicy(
+                allow_private_networks=True,
+                user_agent="custom-client/1.0",
+            ),
+            "custom-client/1.0",
+        ),
+    ],
+)
+def test_retriever_transmits_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: RetrievalPolicy,
+    expected_user_agent: str,
+) -> None:
+    original = httpx.Client
+    observed: list[str] = []
+
+    def response(request: httpx.Request) -> httpx.Response:
+        observed.append(request.headers["user-agent"])
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/rss+xml"},
+            content=b'<?xml version="1.0"?><rss version="2.0"><channel/></rss>',
+            request=request,
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: original(transport=httpx.MockTransport(response), **kwargs),
+    )
+    HttpxFeedRetriever().fetch("https://example.com/feed", policy)
+    assert observed == [expected_user_agent]

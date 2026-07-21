@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from feed_sentiment._metadata import default_user_agent
 from feed_sentiment.exceptions import (
     ContentTypeError,
     ResponseSizeError,
@@ -23,7 +24,7 @@ class RetrievalPolicy:
     max_redirects: int = 5
     max_response_bytes: int = 5 * 1024 * 1024
     allow_private_networks: bool = False
-    user_agent: str = "feed-sentiment/0.1.0 (+https://github.com/kurtpatrickyu/feed-sentiment)"
+    user_agent: str = field(default_factory=default_user_agent)
 
 
 @dataclass(frozen=True, slots=True)

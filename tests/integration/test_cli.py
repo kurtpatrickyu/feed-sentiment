@@ -7,6 +7,7 @@ from typing import NoReturn
 import pytest
 from typer.testing import CliRunner
 
+from feed_sentiment import __version__
 from feed_sentiment.cli.app import app
 from feed_sentiment.exceptions import RetrievalError
 from feed_sentiment.models import AnalysisWarning, FeedAnalysisSnapshot, FeedMetadata, WarningCode
@@ -29,7 +30,7 @@ def test_help_and_version_do_not_analyze() -> None:
     assert runner.invoke(app, ["--help"]).exit_code == 0
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert result.stdout.strip()
+    assert result.stdout.strip() == __version__
 
 
 def test_json_is_clean_and_unicode(monkeypatch: pytest.MonkeyPatch) -> None:

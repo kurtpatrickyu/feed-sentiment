@@ -1,5 +1,4 @@
-from importlib.metadata import PackageNotFoundError, version
-
+from feed_sentiment._metadata import package_version
 from feed_sentiment.exceptions import (
     AnalysisError,
     ContentTypeError,
@@ -27,10 +26,7 @@ from feed_sentiment.models import (
 )
 from feed_sentiment.services import analyze_entries, analyze_feed, analyze_text
 
-try:
-    __version__ = version("feed-sentiment")
-except PackageNotFoundError:
-    __version__ = "0+unknown"
+__version__ = package_version()
 
 __all__ = [
     "AnalysisError",
